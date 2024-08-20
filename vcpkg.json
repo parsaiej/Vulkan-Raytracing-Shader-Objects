@@ -1,0 +1,10 @@
+{
+    "dependencies": [
+      { "name": "spdlog", "features": ["wchar"] },
+      "volk",
+      "glfw3",
+      "vulkan-memory-allocator",
+      "glm"
+    ]
+  }
+  
