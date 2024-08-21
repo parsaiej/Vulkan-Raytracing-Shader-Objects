@@ -303,16 +303,10 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     // Build
     // ------------------------------------------------
 
-    VkAccelerationStructureBuildGeometryInfoKHR blasBuildInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
     {
-        blasBuildInfo.sType                     = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-        blasBuildInfo.type                      = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        blasBuildInfo.flags                     = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        blasBuildInfo.mode                      = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        blasBuildInfo.dstAccelerationStructure  = g_BLAS;
-        blasBuildInfo.geometryCount             = 1;
-        blasBuildInfo.pGeometries               = &blasGeometryInfo;
-        blasBuildInfo.scratchData.deviceAddress = GetBufferDeviceAddress(pRenderContext, scratchBuffer);
+        // Rest is defined above.
+        blasBuildGeometryInfo.scratchData.deviceAddress = GetBufferDeviceAddress(pRenderContext, scratchBuffer);
+        blasBuildGeometryInfo.dstAccelerationStructure  = g_BLAS;
     }
 
     VkAccelerationStructureBuildRangeInfoKHR blasBuildRangeInfo;
@@ -327,7 +321,7 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     VkCommandBuffer vkCommand = VK_NULL_HANDLE;
     SingleShotCommandBegin(pRenderContext, vkCommand, vkCommandPool);
     {
-        vkCmdBuildAccelerationStructuresKHR(vkCommand, 1U, &blasBuildInfo, blasBuildRangeInfos.data());
+        vkCmdBuildAccelerationStructuresKHR(vkCommand, 1U, &blasBuildGeometryInfo, blasBuildRangeInfos.data());
     }
     SingleShotCommandEnd(pRenderContext, vkCommand);
 
@@ -343,6 +337,142 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     vmaDestroyBuffer(pRenderContext->GetAllocator(), scratchBuffer.buffer, scratchBuffer.bufferAllocation);
 
     spdlog::info("Built bottom-level acceleration structure.");
+}
+
+void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t indexCount)
+{
+    VkAccelerationStructureInstanceKHR tlasInstance {};
+    {
+        tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+        tlasInstance.instanceCustomIndex                    = 0;
+        tlasInstance.mask                                   = 0xFF;
+        tlasInstance.instanceShaderBindingTableRecordOffset = 0;
+        tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
+    }
+
+    // Create Instances Buffer.
+    // ------------------------------------------------
+
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.usage              = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bufferInfo.size               = sizeof(VkAccelerationStructureInstanceKHR);
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage                   = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    Buffer instanceBuffer;
+    Check(vmaCreateBuffer(pRenderContext->GetAllocator(), &bufferInfo, &allocInfo, &instanceBuffer.buffer, &instanceBuffer.bufferAllocation, nullptr),
+          "Failed to create staging buffer memory.");
+
+    // Copy Instances Host -> Staging Memory.
+    // -----------------------------------------------------
+
+    void* pMappedData = nullptr;
+    Check(vmaMapMemory(pRenderContext->GetAllocator(), instanceBuffer.bufferAllocation, &pMappedData), "Failed to map a pointer to staging memory.");
+    {
+        // Copy from Host -> Staging memory.
+        memcpy(pMappedData, &tlasInstance, sizeof(VkAccelerationStructureInstanceKHR));
+
+        vmaUnmapMemory(pRenderContext->GetAllocator(), instanceBuffer.bufferAllocation);
+    }
+
+    // The top level acceleration structure contains (bottom level) instance as the input geometry
+    VkAccelerationStructureGeometryKHR tlasGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+    tlasGeometryInfo.geometryType                          = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeometryInfo.flags                                 = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tlasGeometryInfo.geometry.instances.sType              = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasGeometryInfo.geometry.instances.arrayOfPointers    = VK_FALSE;
+    tlasGeometryInfo.geometry.instances.data.deviceAddress = GetBufferDeviceAddress(pRenderContext, instanceBuffer);
+
+    // Get the size requirements for buffers involved in the acceleration structure build process
+    VkAccelerationStructureBuildGeometryInfoKHR tlasGeometryBuildInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    tlasGeometryBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlasGeometryBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlasGeometryBuildInfo.geometryCount = 1;
+    tlasGeometryBuildInfo.pGeometries   = &tlasGeometryInfo;
+
+    const uint32_t primitiveCount = indexCount / 3U;
+
+    VkAccelerationStructureBuildSizesInfoKHR tlasBuildSizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+    vkGetAccelerationStructureBuildSizesKHR(pRenderContext->GetDevice(),
+                                            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                            &tlasGeometryBuildInfo,
+                                            &primitiveCount,
+                                            &tlasBuildSizeInfo);
+
+    // Create Instances Buffer.
+    // ------------------------------------------------
+
+    bufferInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bufferInfo.size  = tlasBuildSizeInfo.accelerationStructureSize;
+    allocInfo.usage  = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    Check(vmaCreateBuffer(pRenderContext->GetAllocator(),
+                          &bufferInfo,
+                          &allocInfo,
+                          &g_TLASBackingMemory.buffer,
+                          &g_TLASBackingMemory.bufferAllocation,
+                          nullptr),
+          "Failed to create backing memory for TLAS.");
+
+    // Create intermediate scratch memory
+    // ------------------------------------------------
+
+    bufferInfo.size  = tlasBuildSizeInfo.buildScratchSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    allocInfo.usage  = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    Buffer scratchBuffer;
+    Check(vmaCreateBuffer(pRenderContext->GetAllocator(), &bufferInfo, &allocInfo, &scratchBuffer.buffer, &scratchBuffer.bufferAllocation, nullptr),
+          "Failed to create scratch buffer memory.");
+
+    // Create TLAS
+    // ------------------------------------------------
+
+    VkAccelerationStructureCreateInfoKHR tlasCreateInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
+    {
+        tlasCreateInfo.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+        tlasCreateInfo.buffer = g_TLASBackingMemory.buffer;
+        tlasCreateInfo.size   = tlasBuildSizeInfo.accelerationStructureSize;
+        tlasCreateInfo.type   = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    }
+    vkCreateAccelerationStructureKHR(pRenderContext->GetDevice(), &tlasCreateInfo, nullptr, &g_TLAS);
+
+    {
+        tlasGeometryBuildInfo.dstAccelerationStructure  = g_TLAS;
+        tlasGeometryBuildInfo.scratchData.deviceAddress = GetBufferDeviceAddress(pRenderContext, scratchBuffer);
+    }
+
+    VkAccelerationStructureBuildRangeInfoKHR tlasBuildRangeInfo;
+    {
+        tlasBuildRangeInfo.primitiveCount  = 1;
+        tlasBuildRangeInfo.primitiveOffset = 0;
+        tlasBuildRangeInfo.firstVertex     = 0;
+        tlasBuildRangeInfo.transformOffset = 0;
+    }
+    std::vector<VkAccelerationStructureBuildRangeInfoKHR*> tlasBuildRangeInfos = { &tlasBuildRangeInfo };
+
+    VkCommandBuffer vkCommand = VK_NULL_HANDLE;
+    SingleShotCommandBegin(pRenderContext, vkCommand, vkCommandPool);
+    {
+        vkCmdBuildAccelerationStructuresKHR(vkCommand, 1U, &tlasGeometryBuildInfo, tlasBuildRangeInfos.data());
+    }
+    SingleShotCommandEnd(pRenderContext, vkCommand);
+
+    VkAccelerationStructureDeviceAddressInfoKHR tlasDeviceAddressInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+    {
+        tlasDeviceAddressInfo.accelerationStructure = g_TLAS;
+    }
+    g_TLASDeviceAddress = vkGetAccelerationStructureDeviceAddressKHR(pRenderContext->GetDevice(), &tlasDeviceAddressInfo);
+
+    // Release scratch memory
+    // ------------------------------------------------
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), scratchBuffer.buffer, scratchBuffer.bufferAllocation);
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), instanceBuffer.buffer, instanceBuffer.bufferAllocation);
+
+    spdlog::info("Built top-level acceleration structure.");
 }
 
 void InitializeResources(RenderContext* pRenderContext)
@@ -514,6 +644,7 @@ void InitializeResources(RenderContext* pRenderContext)
     // -----------------------------------------------------
 
     BuildBLAS(pRenderContext, vkCommandPool, (uint32_t)meshVertices.size(), (uint32_t)meshIndices.size());
+    BuildTLAS(pRenderContext, vkCommandPool, (uint32_t)meshIndices.size());
 
     // Release staging memory.
     // ------------------------------------------------
@@ -536,8 +667,10 @@ void FreeResources(RenderContext* pRenderContext)
     vkDeviceWaitIdle(pRenderContext->GetDevice());
 
     vkDestroyAccelerationStructureKHR(pRenderContext->GetDevice(), g_BLAS, nullptr);
+    vkDestroyAccelerationStructureKHR(pRenderContext->GetDevice(), g_TLAS, nullptr);
 
     vmaDestroyBuffer(pRenderContext->GetAllocator(), g_BLASBackingMemory.buffer, g_BLASBackingMemory.bufferAllocation);
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_TLASBackingMemory.buffer, g_TLASBackingMemory.bufferAllocation);
 
     vkDestroyImageView(pRenderContext->GetDevice(), g_ColorAttachment.imageView, nullptr);
     vkDestroyImageView(pRenderContext->GetDevice(), g_DepthAttachment.imageView, nullptr);
