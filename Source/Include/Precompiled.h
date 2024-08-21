@@ -17,6 +17,7 @@
 #include <volk.h>
 #include <vk_mem_alloc.h>
 #include <GLFW/glfw3.h>
+#include <tiny_obj_loader.h>
 /* clang-format on */
 
 #include <spdlog/sinks/ostream_sink.h> // For imgui.
@@ -41,8 +42,5 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
-
-#define GLM_ENABLE_EXPERIMENTAL
-#include <glm/gtx/string_cast.hpp>
 
 #endif

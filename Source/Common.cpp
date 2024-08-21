@@ -183,16 +183,18 @@ bool CreateVulkanLogicalDevice(const VkPhysicalDevice&         vkPhysicalDevice,
     vkGraphicsQueueCreateInfo.queueCount              = 1U;
     vkGraphicsQueueCreateInfo.pQueuePriorities        = &graphicsQueuePriority;
 
-    VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeature = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT };
-    VkPhysicalDeviceVulkan13Features        vulkan13Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
-    VkPhysicalDeviceVulkan12Features        vulkan12Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
-    VkPhysicalDeviceVulkan11Features        vulkan11Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
-    VkPhysicalDeviceFeatures2               vulkan10Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR acFeature           = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+    VkPhysicalDeviceShaderObjectFeaturesEXT          shaderObjectFeature = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT };
+    VkPhysicalDeviceVulkan13Features                 vulkan13Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceVulkan12Features                 vulkan12Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceVulkan11Features                 vulkan11Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+    VkPhysicalDeviceFeatures2                        vulkan10Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 
-    vulkan13Features.pNext = &shaderObjectFeature;
-    vulkan12Features.pNext = &vulkan13Features;
-    vulkan11Features.pNext = &vulkan12Features;
-    vulkan10Features.pNext = &vulkan11Features;
+    shaderObjectFeature.pNext = &acFeature;
+    vulkan13Features.pNext    = &shaderObjectFeature;
+    vulkan12Features.pNext    = &vulkan13Features;
+    vulkan11Features.pNext    = &vulkan12Features;
+    vulkan10Features.pNext    = &vulkan11Features;
 
     // Query for supported features.
     vkGetPhysicalDeviceFeatures2(vkPhysicalDevice, &vulkan10Features);
@@ -209,6 +211,9 @@ bool CreateVulkanLogicalDevice(const VkPhysicalDevice&         vkPhysicalDevice,
             return false;
 
         if ((strcmp(requiredExtension, VK_EXT_SHADER_OBJECT_EXTENSION_NAME) == 0) && shaderObjectFeature.shaderObject != VK_TRUE)
+            return false;
+
+        if ((strcmp(requiredExtension, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) && acFeature.accelerationStructure != VK_TRUE)
             return false;
     }
 
@@ -466,14 +471,15 @@ void DebugLabelBufferResource(RenderContext* pRenderContext, const Buffer& buffe
 #endif
 }
 
-void SingleShotCommandBegin(RenderContext* pRenderContext, VkCommandBuffer& vkCommandBuffer)
+void SingleShotCommandBegin(RenderContext* pRenderContext, VkCommandBuffer& vkCommandBuffer, VkCommandPool vkCommandPool)
 {
     VkCommandBufferAllocateInfo vkCommandAllocateInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     {
         vkCommandAllocateInfo.commandBufferCount = 1U;
-        vkCommandAllocateInfo.commandPool        = pRenderContext->GetCommandPool();
-    }
 
+        // Optionally use provided command pool made from another thread.
+        vkCommandAllocateInfo.commandPool = vkCommandPool != VK_NULL_HANDLE ? vkCommandPool : pRenderContext->GetCommandPool();
+    }
     Check(vkAllocateCommandBuffers(pRenderContext->GetDevice(), &vkCommandAllocateInfo, &vkCommandBuffer), "Failed to created command buffer");
 
     VkCommandBufferBeginInfo vkCommandsBeginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -492,6 +498,9 @@ void SingleShotCommandEnd(RenderContext* pRenderContext, VkCommandBuffer& vkComm
         vkSubmitInfo.commandBufferCount = 1U;
         vkSubmitInfo.pCommandBuffers    = &vkCommandBuffer;
     }
+
+    std::lock_guard<std::mutex> commandQueueLock(pRenderContext->GetCommandQueueMutex());
+
     Check(vkQueueSubmit(pRenderContext->GetCommandQueue(), 1U, &vkSubmitInfo, VK_NULL_HANDLE), "Failed to submit commands to the graphics queue.");
 
     // Wait for the commands to complete.

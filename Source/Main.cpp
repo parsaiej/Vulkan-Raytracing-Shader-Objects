@@ -13,6 +13,20 @@ void FreeResources(RenderContext* pRenderContext);
 Image g_ColorAttachment {};
 Image g_DepthAttachment {};
 
+Buffer g_MeshVertexBuffer {};
+Buffer g_MeshIndexBuffer {};
+
+std::atomic<bool> g_ResourcesReadyFence;
+
+// Layout of the standard Vertex for this application.
+// ---------------------------------------------------------
+
+struct Vertex
+{
+    glm::vec3 positionOS;
+    glm::vec3 normalOS;
+};
+
 // Entry-point
 // --------------------------------------
 
@@ -36,19 +50,19 @@ int main()
     // Initialize
     // ------------------------------------------------
 
-    InitializeResources(pRenderContext.get());
+    std::jthread loadResourcesAsync(InitializeResources, pRenderContext.get());
 
     // UI
     // ------------------------------------------------
 
     auto RecordInterface = [&]()
     {
-        ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, FLT_MAX));
 
-        if (ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar))
+        if (ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
         {
-            if (ImGui::BeginChild("LogSubWindow", ImVec2(0, 300), 1, ImGuiWindowFlags_HorizontalScrollbar))
+            if (ImGui::BeginChild("LogSubWindow", ImVec2(600, 100), 1, ImGuiWindowFlags_HorizontalScrollbar))
             {
                 ImGui::TextUnformatted(loggerMemory->str().c_str());
 
@@ -69,6 +83,20 @@ int main()
 
     auto RecordCommands = [&](FrameParams frameParams)
     {
+        if (!g_ResourcesReadyFence.load())
+        {
+            VulkanColorImageBarrier(frameParams.cmd,
+                                    frameParams.backBuffer,
+                                    VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                    VK_ACCESS_2_MEMORY_READ_BIT,
+                                    VK_ACCESS_2_MEMORY_READ_BIT,
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+
+            return;
+        }
+
         // Configure Attachments
         // --------------------------------------------
 
@@ -185,6 +213,227 @@ void InitializeResources(RenderContext* pRenderContext)
     // ------------------------------------------------
 
     Check(CreateRenderingAttachments(pRenderContext, g_ColorAttachment, g_DepthAttachment), "Failed to create the rendering attachments.");
+
+    // Create command pool for this thread.
+    // ------------------------------------------------
+
+    VkCommandPoolCreateInfo vkCommandPoolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    {
+        vkCommandPoolInfo.queueFamilyIndex = pRenderContext->GetCommandQueueIndex();
+    }
+
+    VkCommandPool vkCommandPool;
+    Check(vkCreateCommandPool(pRenderContext->GetDevice(), &vkCommandPoolInfo, nullptr, &vkCommandPool), "Failed to create a Vulkan Command Pool");
+
+    // Mesh resource loading utility.
+    // ------------------------------------------------
+
+    auto LoadMesh = [&](const char* filePath, std::vector<Vertex>& vertexData, std::vector<uint32_t>& indices) -> bool
+    {
+        tinyobj::ObjReader reader;
+
+        if (!reader.ParseFromFile(filePath))
+        {
+            if (!reader.Error().empty())
+            {
+                spdlog::error("Failed to load mesh: {}", reader.Error());
+                return false;
+            }
+        }
+
+        auto& attrib = reader.GetAttrib();
+        auto& shapes = reader.GetShapes();
+
+        for (const auto& shape : shapes)
+        {
+            for (const auto& index : shape.mesh.indices)
+            {
+                Vertex v;
+
+                // Positions
+                v.positionOS.x = attrib.vertices[3U * index.vertex_index + 0U];
+                v.positionOS.y = attrib.vertices[3U * index.vertex_index + 1U];
+                v.positionOS.z = attrib.vertices[3U * index.vertex_index + 2U];
+
+                // Normals
+                v.normalOS.x = attrib.normals[3U * index.normal_index + 0U];
+                v.normalOS.y = attrib.normals[3U * index.normal_index + 1U];
+                v.normalOS.z = attrib.normals[3U * index.normal_index + 2U];
+
+                vertexData.push_back(v);
+                indices.push_back((uint32_t)indices.size());
+            }
+        }
+
+        spdlog::info("Loaded Mesh: {}", filePath);
+
+        return true;
+    };
+
+    // Create staging memory.
+    // ------------------------------------------------
+
+    Buffer stagingBuffer {};
+    {
+        VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufferInfo.usage              = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+        // Staging memory is 256mb. Hope it's enough!
+        bufferInfo.size = static_cast<VkDeviceSize>(256U * 1024U * 1024U);
+
+        VmaAllocationCreateInfo allocInfo = {};
+        allocInfo.usage                   = VMA_MEMORY_USAGE_AUTO;
+        allocInfo.flags                   = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+
+        Check(
+            vmaCreateBuffer(pRenderContext->GetAllocator(), &bufferInfo, &allocInfo, &stagingBuffer.buffer, &stagingBuffer.bufferAllocation, nullptr),
+            "Failed to create staging buffer memory.");
+    }
+
+    // Mesh resource loading utility.
+    // ------------------------------------------------
+
+    auto CreateMeshBuffer = [&](void* pData, uint32_t dataSize, VkBufferUsageFlags usage, Buffer* pBuffer)
+    {
+        // Create dedicate device memory for the mesh buffer.
+        // -----------------------------------------------------
+
+        VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufferInfo.size               = dataSize;
+        bufferInfo.usage              = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+        VmaAllocationCreateInfo allocInfo = {};
+        allocInfo.usage                   = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+        Check(vmaCreateBuffer(pRenderContext->GetAllocator(), &bufferInfo, &allocInfo, &pBuffer->buffer, &pBuffer->bufferAllocation, nullptr),
+              "Failed to create dedicated buffer memory.");
+
+        // Copy Host -> Staging Memory.
+        // -----------------------------------------------------
+
+        void* pMappedData = nullptr;
+        Check(vmaMapMemory(pRenderContext->GetAllocator(), stagingBuffer.bufferAllocation, &pMappedData),
+              "Failed to map a pointer to staging memory.");
+        {
+            // Copy from Host -> Staging memory.
+            memcpy(pMappedData, pData, dataSize);
+
+            vmaUnmapMemory(pRenderContext->GetAllocator(), stagingBuffer.bufferAllocation);
+        }
+
+        // Copy Staging -> Device Memory.
+        // -----------------------------------------------------
+
+        VkCommandBuffer vkCommand = VK_NULL_HANDLE;
+        SingleShotCommandBegin(pRenderContext, vkCommand, vkCommandPool);
+        {
+            VmaAllocationInfo allocationInfo;
+            vmaGetAllocationInfo(pRenderContext->GetAllocator(), pBuffer->bufferAllocation, &allocationInfo);
+
+            VkBufferCopy copyInfo;
+            {
+                copyInfo.srcOffset = 0U;
+                copyInfo.dstOffset = 0U;
+                copyInfo.size      = dataSize;
+            }
+            vkCmdCopyBuffer(vkCommand, stagingBuffer.buffer, pBuffer->buffer, 1U, &copyInfo);
+        }
+        SingleShotCommandEnd(pRenderContext, vkCommand);
+    };
+
+    // Load instance transforms.
+    // ------------------------------------------------
+
+    std::vector<Vertex>   instanceVertices;
+    std::vector<uint32_t> unused;
+    if (!LoadMesh("..\\Assets\\instance_transforms.obj", instanceVertices, unused))
+        return;
+
+    // Create device mesh.
+    // ------------------------------------------------
+
+    std::vector<Vertex>   meshVertices;
+    std::vector<uint32_t> meshIndices;
+    if (!LoadMesh("..\\Assets\\bunny.obj", meshVertices, meshIndices))
+        return;
+
+    // Create dedicate device memory for the mesh buffer.
+    // -----------------------------------------------------
+
+    CreateMeshBuffer(meshVertices.data(),
+                     sizeof(Vertex) * (uint32_t)meshVertices.size(),
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     &g_MeshVertexBuffer);
+
+    CreateMeshBuffer(meshIndices.data(),
+                     sizeof(uint32_t) * (uint32_t)meshIndices.size(),
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     &g_MeshIndexBuffer);
+
+    // Util for getting device address of buffers (needed a lot during acceleration structure building).
+    // -----------------------------------------------------
+
+    auto GetBufferDeviceAddress = [&](const Buffer& buffer) -> VkDeviceOrHostAddressConstKHR
+    {
+        VkDeviceOrHostAddressConstKHR addressInfo {};
+        {
+            VkBufferDeviceAddressInfoKHR deviceAddressInfo {};
+            {
+                deviceAddressInfo.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                deviceAddressInfo.buffer = buffer.buffer;
+            }
+            addressInfo.deviceAddress = vkGetBufferDeviceAddressKHR(pRenderContext->GetDevice(), &deviceAddressInfo);
+        }
+        return addressInfo;
+    };
+
+    // Create bottom level acceleration structure.
+    // -----------------------------------------------------
+
+    VkAccelerationStructureGeometryKHR blasGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+    {
+        blasGeometryInfo.geometryType                    = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        blasGeometryInfo.flags                           = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        blasGeometryInfo.geometry.triangles.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        blasGeometryInfo.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        blasGeometryInfo.geometry.triangles.vertexData   = GetBufferDeviceAddress(g_MeshVertexBuffer);
+        blasGeometryInfo.geometry.triangles.maxVertex    = (uint32_t)meshVertices.size();
+        blasGeometryInfo.geometry.triangles.vertexStride = sizeof(Vertex);
+        blasGeometryInfo.geometry.triangles.indexType    = VK_INDEX_TYPE_UINT32;
+        blasGeometryInfo.geometry.triangles.indexData    = GetBufferDeviceAddress(g_MeshIndexBuffer);
+    }
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasBuildGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    {
+        blasBuildGeometryInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        blasBuildGeometryInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        blasBuildGeometryInfo.geometryCount = 1;
+        blasBuildGeometryInfo.pGeometries   = &blasGeometryInfo;
+    }
+
+    VkAccelerationStructureBuildSizesInfoKHR blasBuildSizesInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+
+    const uint32_t primitiveCount = (uint32_t)meshIndices.size() / 3U;
+    vkGetAccelerationStructureBuildSizesKHR(pRenderContext->GetDevice(),
+                                            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                            &blasBuildGeometryInfo,
+                                            &primitiveCount,
+                                            &blasBuildSizesInfo);
+
+    // Release staging memory.
+    // ------------------------------------------------
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), stagingBuffer.buffer, stagingBuffer.bufferAllocation);
+
+    // Release staging memory.
+    // ------------------------------------------------
+
+    vkDestroyCommandPool(pRenderContext->GetDevice(), vkCommandPool, nullptr);
+
+    // Done.
+    // ------------------------------------------------
+
+    g_ResourcesReadyFence.store(true);
 }
 
 void FreeResources(RenderContext* pRenderContext)
@@ -196,4 +445,7 @@ void FreeResources(RenderContext* pRenderContext)
 
     vmaDestroyImage(pRenderContext->GetAllocator(), g_ColorAttachment.image, g_ColorAttachment.imageAllocation);
     vmaDestroyImage(pRenderContext->GetAllocator(), g_DepthAttachment.image, g_DepthAttachment.imageAllocation);
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_MeshVertexBuffer.buffer, g_MeshVertexBuffer.bufferAllocation);
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_MeshIndexBuffer.buffer, g_MeshIndexBuffer.bufferAllocation);
 }

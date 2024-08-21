@@ -68,16 +68,6 @@ struct PushConstants
     glm::mat4 MatrixV;
 };
 
-// Layout of the standard Vertex for this application.
-// ---------------------------------------------------------
-
-struct Vertex
-{
-    glm::vec3 positionOS;
-    glm::vec3 normalOS;
-    glm::vec2 texCoord0;
-};
-
 // Collection of vulkan primitives to hold the current frame state.
 // ---------------------------------------------------------
 
@@ -133,7 +123,7 @@ void GetVertexInputLayout(std::vector<VkVertexInputBindingDescription2EXT>& bind
 
 bool CreateRenderingAttachments(RenderContext* pRenderContext, Image& colorAttachment, Image& depthAttachment);
 
-void SingleShotCommandBegin(RenderContext* pRenderContext, VkCommandBuffer& vkCommandBuffer);
+void SingleShotCommandBegin(RenderContext* pRenderContext, VkCommandBuffer& vkCommandBuffer, VkCommandPool vkCommandPool = VK_NULL_HANDLE);
 
 void SingleShotCommandEnd(RenderContext* pRenderContext, VkCommandBuffer& vkCommandBuffer);
 

@@ -21,6 +21,7 @@ find_package(volk                  REQUIRED)
 find_package(glfw3                 REQUIRED)
 find_package(glm                   REQUIRED)
 find_package(VulkanMemoryAllocator REQUIRED)
+find_package(tinyobjloader         REQUIRED)
 
 # Imgui
 # --------------------------------
@@ -35,8 +36,7 @@ file(GLOB IMGUI_SRC ${CMAKE_SOURCE_DIR}/External/imgui/imgui.cpp
                     ${CMAKE_SOURCE_DIR}/External/imgui/imgui_demo.cpp
                     ${CMAKE_SOURCE_DIR}/External/imgui/backends/imgui_impl_glfw.cpp
                     ${CMAKE_SOURCE_DIR}/External/imgui/backends/imgui_impl_vulkan.cpp)
-
-                    
+        
 # Executable
 # --------------------------------
 
@@ -66,6 +66,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     spdlog::spdlog_header_only
     glfw
     GPUOpen::VulkanMemoryAllocator
+    tinyobjloader::tinyobjloader
 )
 
 # Defines
