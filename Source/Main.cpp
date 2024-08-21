@@ -19,11 +19,14 @@ Buffer g_MeshIndexBuffer {};
 Buffer g_BLASBackingMemory {};
 Buffer g_TLASBackingMemory {};
 
-VkAccelerationStructureKHR g_BLAS;
-VkAccelerationStructureKHR g_TLAS;
-
 uint64_t g_BLASDeviceAddress;
 uint64_t g_TLASDeviceAddress;
+
+VkAccelerationStructureKHR g_BLAS;
+VkAccelerationStructureKHR g_TLAS;
+VkPipeline                 g_RaytracingPipeline;
+VkDescriptorSetLayout      g_DescriptorSetLayout;
+VkPipelineLayout           g_PipelineLayout;
 
 std::atomic<bool> g_ResourcesReadyFence;
 
@@ -154,6 +157,8 @@ int main()
             };
         }
         vkCmdBeginRendering(frameParams.cmd, &vkRenderingInfo);
+
+        // vkCmdTraceRaysKHR(frameParams.cmd, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, kWindowWidth, kWindowHeight, 1U);
 
         vkCmdEndRendering(frameParams.cmd);
 
@@ -448,7 +453,7 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
     VkAccelerationStructureBuildRangeInfoKHR tlasBuildRangeInfo;
     {
-        tlasBuildRangeInfo.primitiveCount  = 1;
+        tlasBuildRangeInfo.primitiveCount  = primitiveCount;
         tlasBuildRangeInfo.primitiveOffset = 0;
         tlasBuildRangeInfo.firstVertex     = 0;
         tlasBuildRangeInfo.transformOffset = 0;
@@ -477,6 +482,65 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     NameVulkanObject(pRenderContext->GetDevice(), VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)g_TLAS, "TLAS");
 
     spdlog::info("Built top-level acceleration structure.");
+}
+
+void CreateRaytracingPipeline(RenderContext* pRenderContext)
+{
+    std::vector<VkPipelineShaderStageCreateInfo> stageInfos;
+
+    auto PushRaytracingShaderStage = [&](const char* shaderFilePath, VkShaderStageFlagBits stageFlags)
+    {
+        VkPipelineShaderStageCreateInfo stageInfo { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+        {
+            stageInfo.pName = "Main";
+            stageInfo.stage = stageFlags;
+
+            std::vector<char> byteCode;
+            LoadByteCode(shaderFilePath, byteCode);
+
+            VkShaderModuleCreateInfo shaderModuleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+            {
+                shaderModuleInfo.pCode    = reinterpret_cast<uint32_t*>(byteCode.data());
+                shaderModuleInfo.codeSize = byteCode.size();
+            }
+            Check(vkCreateShaderModule(pRenderContext->GetDevice(), &shaderModuleInfo, nullptr, &stageInfo.module),
+                  "Failed to create ray tracing shader.");
+        }
+
+        stageInfos.push_back(stageInfo);
+    };
+
+    PushRaytracingShaderStage("RayGen.spv", VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+
+    VkRayTracingShaderGroupCreateInfoKHR rayGenGroupInfo { VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR };
+    {
+        rayGenGroupInfo.type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        rayGenGroupInfo.generalShader      = 0U;
+        rayGenGroupInfo.closestHitShader   = VK_SHADER_UNUSED_KHR;
+        rayGenGroupInfo.anyHitShader       = VK_SHADER_UNUSED_KHR;
+        rayGenGroupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+
+    VkRayTracingPipelineCreateInfoKHR rayTracingPipelineInfo { VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
+    {
+        rayTracingPipelineInfo.stageCount                   = static_cast<uint32_t>(stageInfos.size());
+        rayTracingPipelineInfo.pStages                      = stageInfos.data();
+        rayTracingPipelineInfo.groupCount                   = 1U;
+        rayTracingPipelineInfo.pGroups                      = &rayGenGroupInfo;
+        rayTracingPipelineInfo.maxPipelineRayRecursionDepth = 1;
+        rayTracingPipelineInfo.layout                       = g_PipelineLayout;
+    }
+    Check(vkCreateRayTracingPipelinesKHR(pRenderContext->GetDevice(),
+                                         VK_NULL_HANDLE,
+                                         VK_NULL_HANDLE,
+                                         1,
+                                         &rayTracingPipelineInfo,
+                                         nullptr,
+                                         &g_RaytracingPipeline),
+          "Failed to create ray tracing pipeline.");
+
+    for (auto& stageInfo : stageInfos)
+        vkDestroyShaderModule(pRenderContext->GetDevice(), stageInfo.module, nullptr);
 }
 
 void InitializeResources(RenderContext* pRenderContext)
@@ -611,6 +675,8 @@ void InitializeResources(RenderContext* pRenderContext)
             vkCmdCopyBuffer(vkCommand, stagingBuffer.buffer, pBuffer->buffer, 1U, &copyInfo);
         }
         SingleShotCommandEnd(pRenderContext, vkCommand);
+
+        NameVulkanObject(pRenderContext->GetDevice(), VK_OBJECT_TYPE_BUFFER, (uint64_t)pBuffer->buffer, "Mesh Buffer");
     };
 
     // Load instance transforms.
@@ -649,6 +715,22 @@ void InitializeResources(RenderContext* pRenderContext)
 
     BuildBLAS(pRenderContext, vkCommandPool, (uint32_t)meshVertices.size(), (uint32_t)meshIndices.size());
     BuildTLAS(pRenderContext, vkCommandPool, (uint32_t)meshIndices.size());
+
+    // Configure Pipeline Layouts
+    // --------------------------------------
+
+    VkPipelineLayoutCreateInfo vkPipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    {
+        // vkPipelineLayoutInfo.setLayoutCount = 1U;
+        // vkPipelineLayoutInfo.pSetLayouts    = &g_DescriptorSetLayout;
+    }
+    Check(vkCreatePipelineLayout(pRenderContext->GetDevice(), &vkPipelineLayoutInfo, nullptr, &g_PipelineLayout),
+          "Failed to create the default Vulkan Pipeline Layout");
+
+    // Create ray tracing pipeline.
+    // -----------------------------------------------------
+
+    CreateRaytracingPipeline(pRenderContext);
 
     // Release staging memory.
     // ------------------------------------------------

@@ -183,6 +183,8 @@ bool CreateVulkanLogicalDevice(const VkPhysicalDevice&         vkPhysicalDevice,
     vkGraphicsQueueCreateInfo.queueCount              = 1U;
     vkGraphicsQueueCreateInfo.pQueuePriorities        = &graphicsQueuePriority;
 
+    VkPhysicalDeviceRayQueryFeaturesKHR              rayQueryFeature     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR    rtFeature           = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
     VkPhysicalDeviceAccelerationStructureFeaturesKHR acFeature           = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
     VkPhysicalDeviceShaderObjectFeaturesEXT          shaderObjectFeature = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT };
     VkPhysicalDeviceVulkan13Features                 vulkan13Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
@@ -190,6 +192,8 @@ bool CreateVulkanLogicalDevice(const VkPhysicalDevice&         vkPhysicalDevice,
     VkPhysicalDeviceVulkan11Features                 vulkan11Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     VkPhysicalDeviceFeatures2                        vulkan10Features    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 
+    rtFeature.pNext           = &rayQueryFeature;
+    acFeature.pNext           = &rtFeature;
     shaderObjectFeature.pNext = &acFeature;
     vulkan13Features.pNext    = &shaderObjectFeature;
     vulkan12Features.pNext    = &vulkan13Features;
