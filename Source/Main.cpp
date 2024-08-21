@@ -16,6 +16,15 @@ Image g_DepthAttachment {};
 Buffer g_MeshVertexBuffer {};
 Buffer g_MeshIndexBuffer {};
 
+Buffer g_BLASBackingMemory {};
+Buffer g_TLASBackingMemory {};
+
+VkAccelerationStructureKHR g_BLAS;
+VkAccelerationStructureKHR g_TLAS;
+
+uint64_t g_BLASDeviceAddress;
+uint64_t g_TLASDeviceAddress;
+
 std::atomic<bool> g_ResourcesReadyFence;
 
 // Layout of the standard Vertex for this application.
@@ -207,6 +216,135 @@ int main()
 // Implementations
 // --------------------------------------
 
+uint64_t GetBufferDeviceAddress(RenderContext* pRenderContext, const Buffer& buffer)
+{
+    VkBufferDeviceAddressInfoKHR deviceAddressInfo {};
+    {
+        deviceAddressInfo.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        deviceAddressInfo.buffer = buffer.buffer;
+    }
+    return vkGetBufferDeviceAddressKHR(pRenderContext->GetDevice(), &deviceAddressInfo);
+}
+
+void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t vertexCount, uint32_t indexCount)
+{
+    VkAccelerationStructureGeometryKHR blasGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+    {
+        blasGeometryInfo.geometryType                                = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        blasGeometryInfo.flags                                       = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        blasGeometryInfo.geometry.triangles.sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        blasGeometryInfo.geometry.triangles.vertexFormat             = VK_FORMAT_R32G32B32_SFLOAT;
+        blasGeometryInfo.geometry.triangles.vertexData.deviceAddress = GetBufferDeviceAddress(pRenderContext, g_MeshVertexBuffer);
+        blasGeometryInfo.geometry.triangles.maxVertex                = vertexCount;
+        blasGeometryInfo.geometry.triangles.vertexStride             = sizeof(Vertex);
+        blasGeometryInfo.geometry.triangles.indexType                = VK_INDEX_TYPE_UINT32;
+        blasGeometryInfo.geometry.triangles.indexData.deviceAddress  = GetBufferDeviceAddress(pRenderContext, g_MeshIndexBuffer);
+    }
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasBuildGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    {
+        blasBuildGeometryInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        blasBuildGeometryInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        blasBuildGeometryInfo.geometryCount = 1;
+        blasBuildGeometryInfo.pGeometries   = &blasGeometryInfo;
+    }
+
+    VkAccelerationStructureBuildSizesInfoKHR blasBuildSizesInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+
+    const uint32_t primitiveCount = indexCount / 3U;
+
+    vkGetAccelerationStructureBuildSizesKHR(pRenderContext->GetDevice(),
+                                            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                            &blasBuildGeometryInfo,
+                                            &primitiveCount,
+                                            &blasBuildSizesInfo);
+
+    // Create backing memory for the BLAS
+    // ------------------------------------------------
+
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.size               = blasBuildSizesInfo.accelerationStructureSize;
+    bufferInfo.usage              = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage                   = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    Check(vmaCreateBuffer(pRenderContext->GetAllocator(),
+                          &bufferInfo,
+                          &allocInfo,
+                          &g_BLASBackingMemory.buffer,
+                          &g_BLASBackingMemory.bufferAllocation,
+                          nullptr),
+          "Failed to create dedicated buffer memory.");
+
+    // Create intermediate scratch memory
+    // ------------------------------------------------
+
+    bufferInfo.size  = blasBuildSizesInfo.buildScratchSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    allocInfo.usage  = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    Buffer scratchBuffer;
+    Check(vmaCreateBuffer(pRenderContext->GetAllocator(), &bufferInfo, &allocInfo, &scratchBuffer.buffer, &scratchBuffer.bufferAllocation, nullptr),
+          "Failed to create dedicated buffer memory.");
+
+    // Create BLAS Primitive
+    // ------------------------------------------------
+
+    VkAccelerationStructureCreateInfoKHR acceleration_structure_create_info { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
+    {
+        acceleration_structure_create_info.buffer = g_BLASBackingMemory.buffer;
+        acceleration_structure_create_info.size   = blasBuildSizesInfo.accelerationStructureSize;
+        acceleration_structure_create_info.type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    }
+    Check(vkCreateAccelerationStructureKHR(pRenderContext->GetDevice(), &acceleration_structure_create_info, nullptr, &g_BLAS),
+          "Failed to create acceleration structure");
+
+    // Build
+    // ------------------------------------------------
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasBuildInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    {
+        blasBuildInfo.sType                     = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        blasBuildInfo.type                      = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        blasBuildInfo.flags                     = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        blasBuildInfo.mode                      = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        blasBuildInfo.dstAccelerationStructure  = g_BLAS;
+        blasBuildInfo.geometryCount             = 1;
+        blasBuildInfo.pGeometries               = &blasGeometryInfo;
+        blasBuildInfo.scratchData.deviceAddress = GetBufferDeviceAddress(pRenderContext, scratchBuffer);
+    }
+
+    VkAccelerationStructureBuildRangeInfoKHR blasBuildRangeInfo;
+    {
+        blasBuildRangeInfo.primitiveCount  = primitiveCount;
+        blasBuildRangeInfo.primitiveOffset = 0;
+        blasBuildRangeInfo.firstVertex     = 0;
+        blasBuildRangeInfo.transformOffset = 0;
+    }
+    std::vector<VkAccelerationStructureBuildRangeInfoKHR*> blasBuildRangeInfos = { &blasBuildRangeInfo };
+
+    VkCommandBuffer vkCommand = VK_NULL_HANDLE;
+    SingleShotCommandBegin(pRenderContext, vkCommand, vkCommandPool);
+    {
+        vkCmdBuildAccelerationStructuresKHR(vkCommand, 1U, &blasBuildInfo, blasBuildRangeInfos.data());
+    }
+    SingleShotCommandEnd(pRenderContext, vkCommand);
+
+    VkAccelerationStructureDeviceAddressInfoKHR blasDeviceAddressInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+    {
+        blasDeviceAddressInfo.accelerationStructure = g_BLAS;
+    }
+    g_BLASDeviceAddress = vkGetAccelerationStructureDeviceAddressKHR(pRenderContext->GetDevice(), &blasDeviceAddressInfo);
+
+    // Release scratch memory
+    // ------------------------------------------------
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), scratchBuffer.buffer, scratchBuffer.bufferAllocation);
+
+    spdlog::info("Built bottom-level acceleration structure.");
+}
+
 void InitializeResources(RenderContext* pRenderContext)
 {
     // Create Rendering Attachments
@@ -362,63 +500,20 @@ void InitializeResources(RenderContext* pRenderContext)
 
     CreateMeshBuffer(meshVertices.data(),
                      sizeof(Vertex) * (uint32_t)meshVertices.size(),
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                      &g_MeshVertexBuffer);
 
     CreateMeshBuffer(meshIndices.data(),
                      sizeof(uint32_t) * (uint32_t)meshIndices.size(),
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                      &g_MeshIndexBuffer);
 
-    // Util for getting device address of buffers (needed a lot during acceleration structure building).
+    // Create acceleration structure.
     // -----------------------------------------------------
 
-    auto GetBufferDeviceAddress = [&](const Buffer& buffer) -> VkDeviceOrHostAddressConstKHR
-    {
-        VkDeviceOrHostAddressConstKHR addressInfo {};
-        {
-            VkBufferDeviceAddressInfoKHR deviceAddressInfo {};
-            {
-                deviceAddressInfo.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-                deviceAddressInfo.buffer = buffer.buffer;
-            }
-            addressInfo.deviceAddress = vkGetBufferDeviceAddressKHR(pRenderContext->GetDevice(), &deviceAddressInfo);
-        }
-        return addressInfo;
-    };
-
-    // Create bottom level acceleration structure.
-    // -----------------------------------------------------
-
-    VkAccelerationStructureGeometryKHR blasGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
-    {
-        blasGeometryInfo.geometryType                    = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        blasGeometryInfo.flags                           = VK_GEOMETRY_OPAQUE_BIT_KHR;
-        blasGeometryInfo.geometry.triangles.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-        blasGeometryInfo.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        blasGeometryInfo.geometry.triangles.vertexData   = GetBufferDeviceAddress(g_MeshVertexBuffer);
-        blasGeometryInfo.geometry.triangles.maxVertex    = (uint32_t)meshVertices.size();
-        blasGeometryInfo.geometry.triangles.vertexStride = sizeof(Vertex);
-        blasGeometryInfo.geometry.triangles.indexType    = VK_INDEX_TYPE_UINT32;
-        blasGeometryInfo.geometry.triangles.indexData    = GetBufferDeviceAddress(g_MeshIndexBuffer);
-    }
-
-    VkAccelerationStructureBuildGeometryInfoKHR blasBuildGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
-    {
-        blasBuildGeometryInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        blasBuildGeometryInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        blasBuildGeometryInfo.geometryCount = 1;
-        blasBuildGeometryInfo.pGeometries   = &blasGeometryInfo;
-    }
-
-    VkAccelerationStructureBuildSizesInfoKHR blasBuildSizesInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-
-    const uint32_t primitiveCount = (uint32_t)meshIndices.size() / 3U;
-    vkGetAccelerationStructureBuildSizesKHR(pRenderContext->GetDevice(),
-                                            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                            &blasBuildGeometryInfo,
-                                            &primitiveCount,
-                                            &blasBuildSizesInfo);
+    BuildBLAS(pRenderContext, vkCommandPool, (uint32_t)meshVertices.size(), (uint32_t)meshIndices.size());
 
     // Release staging memory.
     // ------------------------------------------------
@@ -439,6 +534,10 @@ void InitializeResources(RenderContext* pRenderContext)
 void FreeResources(RenderContext* pRenderContext)
 {
     vkDeviceWaitIdle(pRenderContext->GetDevice());
+
+    vkDestroyAccelerationStructureKHR(pRenderContext->GetDevice(), g_BLAS, nullptr);
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_BLASBackingMemory.buffer, g_BLASBackingMemory.bufferAllocation);
 
     vkDestroyImageView(pRenderContext->GetDevice(), g_ColorAttachment.imageView, nullptr);
     vkDestroyImageView(pRenderContext->GetDevice(), g_DepthAttachment.imageView, nullptr);
