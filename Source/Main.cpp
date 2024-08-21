@@ -336,6 +336,8 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
     vmaDestroyBuffer(pRenderContext->GetAllocator(), scratchBuffer.buffer, scratchBuffer.bufferAllocation);
 
+    NameVulkanObject(pRenderContext->GetDevice(), VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)g_BLAS, "BLAS");
+
     spdlog::info("Built bottom-level acceleration structure.");
 }
 
@@ -471,6 +473,8 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
     vmaDestroyBuffer(pRenderContext->GetAllocator(), scratchBuffer.buffer, scratchBuffer.bufferAllocation);
     vmaDestroyBuffer(pRenderContext->GetAllocator(), instanceBuffer.buffer, instanceBuffer.bufferAllocation);
+
+    NameVulkanObject(pRenderContext->GetDevice(), VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)g_TLAS, "TLAS");
 
     spdlog::info("Built top-level acceleration structure.");
 }
