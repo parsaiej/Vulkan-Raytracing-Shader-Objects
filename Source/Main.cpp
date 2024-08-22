@@ -184,17 +184,27 @@ int main()
         vkCmdEndRendering(frameParams.cmd);
 
         // Temp camera
-        auto matrixV = glm::lookAt(glm::vec3(0, 0, -50), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
-        auto matrixP = glm::perspective(glm::radians(60.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
-
         {
+            static float s_Time = 0.0F;
+
+            auto matrixV =
+                glm::lookAt(glm::vec3(50 * std::sin(0.2 * s_Time), 0, 50 * std::cos(0.2 * s_Time)), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
+            auto matrixP = glm::perspective(glm::radians(30.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
+
+            s_Time += (float)frameParams.deltaTime;
+
             g_PushConstants.InverseMatrixV = glm::inverse(matrixV);
             g_PushConstants.InverseMatrixP = glm::inverse(matrixP);
+
+            vkCmdPushConstants(frameParams.cmd,
+                               g_PipelineLayout,
+                               VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+                               0U,
+                               sizeof(RaytracingPushConstants),
+                               &g_PushConstants);
         }
-        vkCmdPushConstants(frameParams.cmd, g_PipelineLayout, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0U, sizeof(RaytracingPushConstants), &g_PushConstants);
 
         // Dispatch rays.
-
         {
             VulkanColorImageBarrier(frameParams.cmd,
                                     g_ColorAttachment.image,
@@ -426,8 +436,6 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
 void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t indexCount, const std::vector<Vertex>& instanceTransforms)
 {
-    std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
-
     auto ComputeTransformForPoint = [&](Vertex point) -> VkTransformMatrixKHR
     {
         glm::vec3 U = glm::normalize(point.normalOS);
@@ -437,38 +445,43 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
         F = glm::normalize(glm::cross(U, R));
 
         glm::mat4 rotation = glm::mat4(1.0f);
-        rotation[0]        = glm::vec4(R, 0.0f); // X-axis (right vector)
-        rotation[1]        = glm::vec4(U, 0.0f); // Y-axis (up vector)
-        rotation[2]        = glm::vec4(F, 0.0f); // Z-axis (forward vector)
+        rotation[0]        = glm::vec4(R, 0.0f);
+        rotation[1]        = glm::vec4(U, 0.0f);
+        rotation[2]        = glm::vec4(F, 0.0f);
 
         glm::mat4 translation = glm::translate(glm::mat4(1.0f), point.positionOS);
 
-        // Adapt into the VK type.
+        glm::mat4 transform = translation * rotation;
+
         VkTransformMatrixKHR vkTransform;
 
         for (int row = 0; row < 3; ++row)
         {
             for (int col = 0; col < 4; ++col)
             {
-                vkTransform.matrix[row][col] = translation[col][row];
+                vkTransform.matrix[row][col] = transform[col][row];
             }
         }
 
         return vkTransform;
     };
 
-    VkAccelerationStructureInstanceKHR tlasInstance {};
+    VkAccelerationStructureInstanceKHR instance {};
     {
-        // tlasInstance.transform = ComputeTransformForPoint(instanceTransforms[0]);
-        tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
-        tlasInstance.instanceCustomIndex                    = 0;
-        tlasInstance.mask                                   = 0xFF;
-        tlasInstance.instanceShaderBindingTableRecordOffset = 0;
-        tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
+        instance.instanceCustomIndex                    = 0;
+        instance.mask                                   = 0xFF;
+        instance.instanceShaderBindingTableRecordOffset = 0;
+        instance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        instance.accelerationStructureReference         = g_BLASDeviceAddress;
     }
 
-    tlasInstances.push_back(tlasInstance);
+    std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+
+    for (const auto& transform : instanceTransforms)
+    {
+        instance.transform = ComputeTransformForPoint(transform);
+        tlasInstances.push_back(instance);
+    }
 
     // Create Instances Buffer.
     // ------------------------------------------------
@@ -496,7 +509,6 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
         vmaUnmapMemory(pRenderContext->GetAllocator(), instanceBuffer.bufferAllocation);
     }
 
-    // The top level acceleration structure contains (bottom level) instance as the input geometry
     VkAccelerationStructureGeometryKHR tlasGeometryInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
     tlasGeometryInfo.geometryType                          = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     tlasGeometryInfo.flags                                 = VK_GEOMETRY_OPAQUE_BIT_KHR;
@@ -504,11 +516,10 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     tlasGeometryInfo.geometry.instances.arrayOfPointers    = VK_FALSE;
     tlasGeometryInfo.geometry.instances.data.deviceAddress = GetBufferDeviceAddress(pRenderContext, instanceBuffer);
 
-    // Get the size requirements for buffers involved in the acceleration structure build process
     VkAccelerationStructureBuildGeometryInfoKHR tlasGeometryBuildInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
     tlasGeometryBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     tlasGeometryBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    tlasGeometryBuildInfo.geometryCount = (uint32_t)tlasInstances.size();
+    tlasGeometryBuildInfo.geometryCount = 1U;
     tlasGeometryBuildInfo.pGeometries   = &tlasGeometryInfo;
 
     const uint32_t primitiveCount = (uint32_t)tlasInstances.size() * (indexCount / 3U);
@@ -565,10 +576,10 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
     VkAccelerationStructureBuildRangeInfoKHR tlasBuildRangeInfo;
     {
-        tlasBuildRangeInfo.primitiveCount  = primitiveCount;
-        tlasBuildRangeInfo.primitiveOffset = 0;
-        tlasBuildRangeInfo.firstVertex     = 0;
-        tlasBuildRangeInfo.transformOffset = 0;
+        tlasBuildRangeInfo.primitiveCount  = (uint32_t)tlasInstances.size();
+        tlasBuildRangeInfo.primitiveOffset = 0U;
+        tlasBuildRangeInfo.firstVertex     = 0U;
+        tlasBuildRangeInfo.transformOffset = 0U;
     }
     std::vector<VkAccelerationStructureBuildRangeInfoKHR*> tlasBuildRangeInfos = { &tlasBuildRangeInfo };
 
