@@ -16,7 +16,7 @@ RenderContext::RenderContext(uint32_t width, uint32_t height)
     Check(glfwVulkanSupported() != 0, "Failed to locate a Vulkan Loader for GLFW.");
 
     VkApplicationInfo vkApplicationInfo  = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    vkApplicationInfo.pApplicationName   = "Vulkan-Raytraced-Indirect";
+    vkApplicationInfo.pApplicationName   = "Vulkan Viewport";
     vkApplicationInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     vkApplicationInfo.pEngineName        = "No Engine";
     vkApplicationInfo.engineVersion      = VK_MAKE_VERSION(0, 0, 0);
@@ -79,7 +79,7 @@ RenderContext::RenderContext(uint32_t width, uint32_t height)
     // ------------------------------------------------
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    m_Window = glfwCreateWindow(static_cast<int>(width), static_cast<int>(height), "Vulkan Raytraced Indirect", nullptr, nullptr);
+    m_Window = glfwCreateWindow(static_cast<int>(width), static_cast<int>(height), "Vulkan Viewport", nullptr, nullptr);
     Check(m_Window != nullptr, "Failed to create the OS Window.");
     Check(glfwCreateWindowSurface(m_VKInstance, m_Window, nullptr, &m_VKSurface), "Failed to create the Vulkan Surface.");
 
