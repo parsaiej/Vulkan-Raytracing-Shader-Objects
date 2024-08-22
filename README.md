@@ -7,6 +7,10 @@ What remains is this small demo app that uploads a Stanford bunny to the bottom-
 <img width="957" alt="image" src="https://github.com/user-attachments/assets/d511727f-2bb7-4601-83dd-6af225d21bb8">
 
 
+Debug view of the acceleration structure in NVIDIA NSight. 
+![Screenshot 2024-08-22 103227](https://github.com/user-attachments/assets/d2c51e77-26d0-4ac0-835d-bcb4511e9442)
+
+
 # Build
 
 ```
