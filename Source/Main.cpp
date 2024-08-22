@@ -8,6 +8,21 @@ void     InitializeResources(RenderContext* pRenderContext);
 void     FreeResources(RenderContext* pRenderContext);
 uint64_t GetBufferDeviceAddress(RenderContext* pRenderContext, const Buffer& buffer);
 
+// Layout of the standard Vertex for this application.
+// ---------------------------------------------------------
+
+struct Vertex
+{
+    glm::vec3 positionOS;
+    glm::vec3 normalOS;
+};
+
+struct RaytracingPushConstants
+{
+    glm::mat4 InverseMatrixV;
+    glm::mat4 InverseMatrixP;
+};
+
 // Resources
 // --------------------------------------
 
@@ -39,22 +54,9 @@ VkImageView           g_ColorImageStorageView;
 
 VkPhysicalDeviceRayTracingPipelinePropertiesKHR g_RayTracingProperties;
 
+RaytracingPushConstants g_PushConstants;
+
 std::atomic<bool> g_ResourcesReadyFence;
-
-// Layout of the standard Vertex for this application.
-// ---------------------------------------------------------
-
-struct Vertex
-{
-    glm::vec3 positionOS;
-    glm::vec3 normalOS;
-};
-
-struct RaytracingPushConstants
-{
-    glm::mat4 InverseMatrixV;
-    glm::mat4 InverseMatrixP;
-};
 
 // Entry-point
 // --------------------------------------
@@ -179,6 +181,16 @@ int main()
 
         vkCmdEndRendering(frameParams.cmd);
 
+        // Temp camera
+        auto matrixV = glm::lookAt(glm::vec3(0, 0, -5), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
+        auto matrixP = glm::perspective(glm::radians(20.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
+
+        {
+            g_PushConstants.InverseMatrixV = glm::inverse(matrixV);
+            g_PushConstants.InverseMatrixP = glm::inverse(matrixP);
+        }
+        vkCmdPushConstants(frameParams.cmd, g_PipelineLayout, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0U, sizeof(RaytracingPushConstants), &g_PushConstants);
+
         // Dispatch rays.
 
         {
@@ -205,12 +217,12 @@ int main()
             shaderBindingAddressRayGen.size          = handleSizeAligned;
 
             VkStridedDeviceAddressRegionKHR shaderBindingAddressHit {};
-            shaderBindingAddressHit.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsRayGen);
+            shaderBindingAddressHit.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsClosestHit);
             shaderBindingAddressHit.stride        = handleSizeAligned;
             shaderBindingAddressHit.size          = handleSizeAligned;
 
             VkStridedDeviceAddressRegionKHR shaderBindingAddressMiss {};
-            shaderBindingAddressMiss.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsRayGen);
+            shaderBindingAddressMiss.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsMiss);
             shaderBindingAddressMiss.stride        = handleSizeAligned;
             shaderBindingAddressMiss.size          = handleSizeAligned;
 
