@@ -24,9 +24,13 @@ uint64_t g_TLASDeviceAddress;
 
 VkAccelerationStructureKHR g_BLAS;
 VkAccelerationStructureKHR g_TLAS;
-VkPipeline                 g_RaytracingPipeline;
-VkDescriptorSetLayout      g_DescriptorSetLayout;
-VkPipelineLayout           g_PipelineLayout;
+
+VkPipeline            g_RaytracingPipeline;
+VkDescriptorSetLayout g_DescriptorSetLayout;
+VkPipelineLayout      g_PipelineLayout;
+VkDescriptorPool      g_DescriptorPool;
+VkDescriptorSet       g_DescriptorSet;
+VkImageView           g_ColorImageStorageView;
 
 std::atomic<bool> g_ResourcesReadyFence;
 
@@ -37,6 +41,12 @@ struct Vertex
 {
     glm::vec3 positionOS;
     glm::vec3 normalOS;
+};
+
+struct RaytracingPushConstants
+{
+    glm::mat4 InverseMatrixV;
+    glm::mat4 InverseMatrixP;
 };
 
 // Entry-point
@@ -716,15 +726,54 @@ void InitializeResources(RenderContext* pRenderContext)
     BuildBLAS(pRenderContext, vkCommandPool, (uint32_t)meshVertices.size(), (uint32_t)meshIndices.size());
     BuildTLAS(pRenderContext, vkCommandPool, (uint32_t)meshIndices.size());
 
+    // Configure Descriptor Set Layout
+    // --------------------------------------
+
+    std::vector<VkDescriptorSetLayoutBinding> descriptorSetBindingInfos;
+
+    auto PushDescriptorBinding = [&](VkDescriptorType descriptorType)
+    {
+        VkDescriptorSetLayoutBinding bindingInfo {};
+        {
+            bindingInfo.binding         = (uint32_t)descriptorSetBindingInfos.size();
+            bindingInfo.descriptorType  = descriptorType;
+            bindingInfo.descriptorCount = 1U;
+            bindingInfo.stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        }
+        descriptorSetBindingInfos.push_back(bindingInfo);
+    };
+
+    PushDescriptorBinding(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+    PushDescriptorBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+
+    VkDescriptorSetLayoutCreateInfo descriptorSetLayout = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    {
+        descriptorSetLayout.bindingCount = (uint32_t)descriptorSetBindingInfos.size();
+        descriptorSetLayout.pBindings    = descriptorSetBindingInfos.data();
+    }
+    vkCreateDescriptorSetLayout(pRenderContext->GetDevice(), &descriptorSetLayout, nullptr, &g_DescriptorSetLayout);
+
+    // Configure Push Constants
+    // --------------------------------------
+
+    VkPushConstantRange vkPushConstants;
+    {
+        vkPushConstants.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        vkPushConstants.offset     = 0U;
+        vkPushConstants.size       = sizeof(RaytracingPushConstants);
+    }
+
     // Configure Pipeline Layouts
     // --------------------------------------
 
-    VkPipelineLayoutCreateInfo vkPipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     {
-        // vkPipelineLayoutInfo.setLayoutCount = 1U;
-        // vkPipelineLayoutInfo.pSetLayouts    = &g_DescriptorSetLayout;
+        pipelineLayoutInfo.setLayoutCount         = 1U;
+        pipelineLayoutInfo.pSetLayouts            = &g_DescriptorSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1U;
+        pipelineLayoutInfo.pPushConstantRanges    = &vkPushConstants;
     }
-    Check(vkCreatePipelineLayout(pRenderContext->GetDevice(), &vkPipelineLayoutInfo, nullptr, &g_PipelineLayout),
+    Check(vkCreatePipelineLayout(pRenderContext->GetDevice(), &pipelineLayoutInfo, nullptr, &g_PipelineLayout),
           "Failed to create the default Vulkan Pipeline Layout");
 
     // Create ray tracing pipeline.
@@ -732,12 +781,78 @@ void InitializeResources(RenderContext* pRenderContext)
 
     CreateRaytracingPipeline(pRenderContext);
 
+    // Create descriptor pool.
+    // -----------------------------------------------------
+
+    std::array<VkDescriptorPoolSize, 2> descriptorPoolSizes = {
+        { { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1U } }
+    };
+
+    VkDescriptorPoolCreateInfo descriptorPoolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    {
+        descriptorPoolInfo.poolSizeCount = (uint32_t)descriptorPoolSizes.size();
+        descriptorPoolInfo.pPoolSizes    = descriptorPoolSizes.data();
+        descriptorPoolInfo.maxSets       = 1U;
+        descriptorPoolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    }
+    Check(vkCreateDescriptorPool(pRenderContext->GetDevice(), &descriptorPoolInfo, VK_NULL_HANDLE, &g_DescriptorPool),
+          "Failed to create Raytracing Descriptor Pool.");
+
+    // Create descriptors.
+    // -----------------------------------------------------
+
+    VkDescriptorSetAllocateInfo descriptorSetAllocInfo { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    {
+        descriptorSetAllocInfo.descriptorSetCount = 1U;
+        descriptorSetAllocInfo.descriptorPool     = g_DescriptorPool;
+        descriptorSetAllocInfo.pSetLayouts        = &g_DescriptorSetLayout;
+    }
+    Check(vkAllocateDescriptorSets(pRenderContext->GetDevice(), &descriptorSetAllocInfo, &g_DescriptorSet),
+          "Failed to allocate raytracing descriptors.");
+
+    std::vector<VkWriteDescriptorSet> descriptorWrites;
+
+    // Descriptor #0
+
+    VkWriteDescriptorSetAccelerationStructureKHR descriptorWriteTLASInfo { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+    {
+        descriptorWriteTLASInfo.accelerationStructureCount = 1U;
+        descriptorWriteTLASInfo.pAccelerationStructures    = &g_TLAS;
+    }
+
+    VkWriteDescriptorSet descriptorWriteInfo0 = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    {
+        descriptorWriteInfo0.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        descriptorWriteInfo0.descriptorCount = 1U;
+        descriptorWriteInfo0.dstBinding      = 0U;
+        descriptorWriteInfo0.dstSet          = g_DescriptorSet;
+        descriptorWriteInfo0.pNext           = &descriptorWriteTLASInfo;
+    }
+
+    // Descriptor #1
+
+    VkDescriptorImageInfo descriptorWriteColorInfo(VK_NULL_HANDLE, g_ColorAttachment.imageView, VK_IMAGE_LAYOUT_GENERAL);
+
+    VkWriteDescriptorSet descriptorWriteInfo1 = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    {
+        descriptorWriteInfo1.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        descriptorWriteInfo1.descriptorCount = 1U;
+        descriptorWriteInfo1.dstBinding      = 1U;
+        descriptorWriteInfo1.dstSet          = g_DescriptorSet;
+        descriptorWriteInfo1.pImageInfo      = &descriptorWriteColorInfo;
+    }
+
+    descriptorWrites.push_back(descriptorWriteInfo0);
+    descriptorWrites.push_back(descriptorWriteInfo1);
+
+    vkUpdateDescriptorSets(pRenderContext->GetDevice(), static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0U, nullptr);
+
     // Release staging memory.
     // ------------------------------------------------
 
     vmaDestroyBuffer(pRenderContext->GetAllocator(), stagingBuffer.buffer, stagingBuffer.bufferAllocation);
 
-    // Release staging memory.
+    // Release thread's command pool.
     // ------------------------------------------------
 
     vkDestroyCommandPool(pRenderContext->GetDevice(), vkCommandPool, nullptr);
@@ -751,6 +866,13 @@ void InitializeResources(RenderContext* pRenderContext)
 void FreeResources(RenderContext* pRenderContext)
 {
     vkDeviceWaitIdle(pRenderContext->GetDevice());
+
+    vkDestroyPipelineLayout(pRenderContext->GetDevice(), g_PipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(pRenderContext->GetDevice(), g_DescriptorSetLayout, nullptr);
+
+    vkDestroyDescriptorPool(pRenderContext->GetDevice(), g_DescriptorPool, nullptr);
+
+    vkDestroyPipeline(pRenderContext->GetDevice(), g_RaytracingPipeline, nullptr);
 
     vkDestroyAccelerationStructureKHR(pRenderContext->GetDevice(), g_BLAS, nullptr);
     vkDestroyAccelerationStructureKHR(pRenderContext->GetDevice(), g_TLAS, nullptr);
