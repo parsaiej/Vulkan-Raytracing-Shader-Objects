@@ -4,8 +4,9 @@
 // Forwards
 // --------------------------------------
 
-void InitializeResources(RenderContext* pRenderContext);
-void FreeResources(RenderContext* pRenderContext);
+void     InitializeResources(RenderContext* pRenderContext);
+void     FreeResources(RenderContext* pRenderContext);
+uint64_t GetBufferDeviceAddress(RenderContext* pRenderContext, const Buffer& buffer);
 
 // Resources
 // --------------------------------------
@@ -15,6 +16,10 @@ Image g_DepthAttachment {};
 
 Buffer g_MeshVertexBuffer {};
 Buffer g_MeshIndexBuffer {};
+
+Buffer g_ShaderBindingsRayGen {};
+Buffer g_ShaderBindingsMiss {};
+Buffer g_ShaderBindingsClosestHit {};
 
 Buffer g_BLASBackingMemory {};
 Buffer g_TLASBackingMemory {};
@@ -31,6 +36,8 @@ VkPipelineLayout      g_PipelineLayout;
 VkDescriptorPool      g_DescriptorPool;
 VkDescriptorSet       g_DescriptorSet;
 VkImageView           g_ColorImageStorageView;
+
+VkPhysicalDeviceRayTracingPipelinePropertiesKHR g_RayTracingProperties;
 
 std::atomic<bool> g_ResourcesReadyFence;
 
@@ -168,9 +175,47 @@ int main()
         }
         vkCmdBeginRendering(frameParams.cmd, &vkRenderingInfo);
 
-        // vkCmdTraceRaysKHR(frameParams.cmd, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, kWindowWidth, kWindowHeight, 1U);
+        // NO-OP
 
         vkCmdEndRendering(frameParams.cmd);
+
+        // Dispatch rays.
+
+        {
+            vkCmdBindPipeline(frameParams.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_RaytracingPipeline);
+
+            vkCmdBindDescriptorSets(frameParams.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_PipelineLayout, 0, 1, &g_DescriptorSet, 0, 0);
+
+            auto handleSize        = g_RayTracingProperties.shaderGroupHandleSize;
+            auto handleAlignment   = g_RayTracingProperties.shaderGroupHandleAlignment;
+            auto handleSizeAligned = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
+
+            VkStridedDeviceAddressRegionKHR shaderBindingAddressRayGen {};
+            shaderBindingAddressRayGen.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsRayGen);
+            shaderBindingAddressRayGen.stride        = handleSizeAligned;
+            shaderBindingAddressRayGen.size          = handleSizeAligned;
+
+            VkStridedDeviceAddressRegionKHR shaderBindingAddressHit {};
+            shaderBindingAddressHit.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsRayGen);
+            shaderBindingAddressHit.stride        = handleSizeAligned;
+            shaderBindingAddressHit.size          = handleSizeAligned;
+
+            VkStridedDeviceAddressRegionKHR shaderBindingAddressMiss {};
+            shaderBindingAddressMiss.deviceAddress = GetBufferDeviceAddress(pRenderContext.get(), g_ShaderBindingsRayGen);
+            shaderBindingAddressMiss.stride        = handleSizeAligned;
+            shaderBindingAddressMiss.size          = handleSizeAligned;
+
+            VkStridedDeviceAddressRegionKHR shaderBindingAddressCallable {};
+
+            vkCmdTraceRaysKHR(frameParams.cmd,
+                              &shaderBindingAddressRayGen,
+                              &shaderBindingAddressMiss,
+                              &shaderBindingAddressHit,
+                              &shaderBindingAddressCallable,
+                              kWindowWidth,
+                              kWindowHeight,
+                              1U);
+        }
 
         // Copy the internal color attachment to back buffer.
 
@@ -551,10 +596,77 @@ void CreateRaytracingPipeline(RenderContext* pRenderContext)
 
     for (auto& stageInfo : stageInfos)
         vkDestroyShaderModule(pRenderContext->GetDevice(), stageInfo.module, nullptr);
+
+    // Create shader binding tables.
+    // ------------------------------------------------
+
+    auto CreateShaderBindingBuffer = [&](Buffer& shaderBindingBuffer, uint32_t shaderBindingBufferSize)
+    {
+        VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufferInfo.size               = shaderBindingBufferSize;
+        bufferInfo.usage =
+            VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+        VmaAllocationCreateInfo allocInfo = {};
+        allocInfo.usage                   = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        Check(vmaCreateBuffer(pRenderContext->GetAllocator(),
+                              &bufferInfo,
+                              &allocInfo,
+                              &shaderBindingBuffer.buffer,
+                              &shaderBindingBuffer.bufferAllocation,
+                              nullptr),
+              "Failed to create dedicated buffer memory.");
+    };
+
+    auto handleSize        = g_RayTracingProperties.shaderGroupHandleSize;
+    auto handleAlignment   = g_RayTracingProperties.shaderGroupHandleAlignment;
+    auto handleSizeAligned = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
+    auto bindingTableSize  = rayTracingPipelineInfo.groupCount * handleSizeAligned;
+
+    CreateShaderBindingBuffer(g_ShaderBindingsRayGen, g_RayTracingProperties.shaderGroupHandleSize);
+    CreateShaderBindingBuffer(g_ShaderBindingsClosestHit, g_RayTracingProperties.shaderGroupHandleSize);
+    CreateShaderBindingBuffer(g_ShaderBindingsMiss, g_RayTracingProperties.shaderGroupHandleSize);
+
+    std::vector<uint8_t> shaderHandles(bindingTableSize);
+    Check(vkGetRayTracingShaderGroupHandlesKHR(pRenderContext->GetDevice(),
+                                               g_RaytracingPipeline,
+                                               0U,
+                                               rayTracingPipelineInfo.groupCount,
+                                               bindingTableSize,
+                                               shaderHandles.data()),
+          "Failed to query shader group handles.");
+
+    auto UploadShaderHandles = [&](Buffer& shaderBindingBuffer, void* pData, uint32_t dataSize)
+    {
+        void* pMappedData = nullptr;
+        Check(vmaMapMemory(pRenderContext->GetAllocator(), shaderBindingBuffer.bufferAllocation, &pMappedData),
+              "Failed to map a pointer to shader binding buffer memory.");
+        {
+            memcpy(pMappedData, pData, dataSize);
+
+            vmaUnmapMemory(pRenderContext->GetAllocator(), shaderBindingBuffer.bufferAllocation);
+        }
+    };
+
+    UploadShaderHandles(g_ShaderBindingsRayGen, shaderHandles.data(), g_RayTracingProperties.shaderGroupHandleSize);
+
+    spdlog::info("Created Ray Tracing Pipeline and Shader Binding Tables.");
 }
 
 void InitializeResources(RenderContext* pRenderContext)
 {
+    // Query raytracing properties.
+    // ------------------------------------------------
+
+    VkPhysicalDeviceProperties2 deviceProperties { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    {
+        g_RayTracingProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+
+        deviceProperties.pNext = &g_RayTracingProperties;
+    }
+    vkGetPhysicalDeviceProperties2(pRenderContext->GetDevicePhysical(), &deviceProperties);
+
     // Create Rendering Attachments
     // ------------------------------------------------
 
@@ -860,6 +972,8 @@ void InitializeResources(RenderContext* pRenderContext)
     // Done.
     // ------------------------------------------------
 
+    spdlog::info("Initialized Resources.");
+
     g_ResourcesReadyFence.store(true);
 }
 
@@ -888,4 +1002,8 @@ void FreeResources(RenderContext* pRenderContext)
 
     vmaDestroyBuffer(pRenderContext->GetAllocator(), g_MeshVertexBuffer.buffer, g_MeshVertexBuffer.bufferAllocation);
     vmaDestroyBuffer(pRenderContext->GetAllocator(), g_MeshIndexBuffer.buffer, g_MeshIndexBuffer.bufferAllocation);
+
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_ShaderBindingsRayGen.buffer, g_ShaderBindingsRayGen.bufferAllocation);
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_ShaderBindingsClosestHit.buffer, g_ShaderBindingsClosestHit.bufferAllocation);
+    vmaDestroyBuffer(pRenderContext->GetAllocator(), g_ShaderBindingsMiss.buffer, g_ShaderBindingsMiss.bufferAllocation);
 }
