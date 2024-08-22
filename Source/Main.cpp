@@ -184,7 +184,7 @@ int main()
         vkCmdEndRendering(frameParams.cmd);
 
         // Temp camera
-        auto matrixV = glm::lookAt(glm::vec3(0, 0, -2), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
+        auto matrixV = glm::lookAt(glm::vec3(0, 0, -50), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
         auto matrixP = glm::perspective(glm::radians(60.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
 
         {
@@ -424,23 +424,51 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     spdlog::info("Built bottom-level acceleration structure.");
 }
 
-void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t indexCount)
+void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t indexCount, const std::vector<Vertex>& instanceTransforms)
 {
     std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
 
+    auto ComputeTransformForPoint = [&](Vertex point) -> VkTransformMatrixKHR
     {
-        VkAccelerationStructureInstanceKHR tlasInstance {};
+        glm::vec3 U = glm::normalize(point.normalOS);
+        glm::vec3 F = glm::normalize(glm::vec3(0.0f, 0.0f, -1.0f));
+        glm::vec3 R = glm::normalize(glm::cross(F, U));
+
+        F = glm::normalize(glm::cross(U, R));
+
+        glm::mat4 rotation = glm::mat4(1.0f);
+        rotation[0]        = glm::vec4(R, 0.0f); // X-axis (right vector)
+        rotation[1]        = glm::vec4(U, 0.0f); // Y-axis (up vector)
+        rotation[2]        = glm::vec4(F, 0.0f); // Z-axis (forward vector)
+
+        glm::mat4 translation = glm::translate(glm::mat4(1.0f), point.positionOS);
+
+        // Adapt into the VK type.
+        VkTransformMatrixKHR vkTransform;
+
+        for (int row = 0; row < 3; ++row)
         {
-            tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
-            tlasInstance.instanceCustomIndex                    = 0;
-            tlasInstance.mask                                   = 0xFF;
-            tlasInstance.instanceShaderBindingTableRecordOffset = 0;
-            tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-            tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
+            for (int col = 0; col < 4; ++col)
+            {
+                vkTransform.matrix[row][col] = translation[col][row];
+            }
         }
 
-        tlasInstances.push_back(tlasInstance);
+        return vkTransform;
+    };
+
+    VkAccelerationStructureInstanceKHR tlasInstance {};
+    {
+        // tlasInstance.transform = ComputeTransformForPoint(instanceTransforms[0]);
+        tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+        tlasInstance.instanceCustomIndex                    = 0;
+        tlasInstance.mask                                   = 0xFF;
+        tlasInstance.instanceShaderBindingTableRecordOffset = 0;
+        tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
     }
+
+    tlasInstances.push_back(tlasInstance);
 
     // Create Instances Buffer.
     // ------------------------------------------------
@@ -848,7 +876,7 @@ void InitializeResources(RenderContext* pRenderContext)
     // -----------------------------------------------------
 
     BuildBLAS(pRenderContext, vkCommandPool, (uint32_t)meshVertices.size(), (uint32_t)meshIndices.size());
-    BuildTLAS(pRenderContext, vkCommandPool, (uint32_t)meshIndices.size());
+    BuildTLAS(pRenderContext, vkCommandPool, (uint32_t)meshIndices.size(), instanceTransforms);
 
     // Configure Descriptor Set Layout
     // --------------------------------------
