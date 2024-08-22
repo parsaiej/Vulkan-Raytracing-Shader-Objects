@@ -1,6 +1,6 @@
 # Vulkan Raytraced Shader Objects
 
-This project was meant to be a test of Vulkan's ray tracing extension usage with the VK_EXT_shader_object extension, until I learned during that the two are not compatible!
+This project was meant to be a test of Vulkan's ray tracing extension usage with the VK_EXT_shader_object extension, until I learned that the two are not compatible!
 
 What remains is this small demo app that uploads a Stanford bunny to the bottom-level acceleration structure and instances it about a thousand times in the top-level acceleration structure.
 
