@@ -182,6 +182,15 @@ int main()
         // Dispatch rays.
 
         {
+            VulkanColorImageBarrier(frameParams.cmd,
+                                    g_ColorAttachment.image,
+                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_GENERAL,
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR);
+
             vkCmdBindPipeline(frameParams.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_RaytracingPipeline);
 
             vkCmdBindDescriptorSets(frameParams.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_PipelineLayout, 0, 1, &g_DescriptorSet, 0, 0);
@@ -221,11 +230,11 @@ int main()
 
         VulkanColorImageBarrier(frameParams.cmd,
                                 g_ColorAttachment.image,
-                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                VK_IMAGE_LAYOUT_GENERAL,
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                 VK_ACCESS_2_TRANSFER_READ_BIT,
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT);
 
         VulkanColorImageBarrier(frameParams.cmd,
@@ -566,22 +575,49 @@ void CreateRaytracingPipeline(RenderContext* pRenderContext)
     };
 
     PushRaytracingShaderStage("RayGen.spv", VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+    PushRaytracingShaderStage("ClosestHit.spv", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+    PushRaytracingShaderStage("Miss.spv", VK_SHADER_STAGE_MISS_BIT_KHR);
 
-    VkRayTracingShaderGroupCreateInfoKHR rayGenGroupInfo { VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR };
+    std::vector<VkRayTracingShaderGroupCreateInfoKHR> groupInfos;
+
     {
-        rayGenGroupInfo.type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-        rayGenGroupInfo.generalShader      = 0U;
-        rayGenGroupInfo.closestHitShader   = VK_SHADER_UNUSED_KHR;
-        rayGenGroupInfo.anyHitShader       = VK_SHADER_UNUSED_KHR;
-        rayGenGroupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+        VkRayTracingShaderGroupCreateInfoKHR rayGenGroupInfo { VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR };
+        {
+            rayGenGroupInfo.type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+            rayGenGroupInfo.generalShader      = 0U;
+            rayGenGroupInfo.closestHitShader   = VK_SHADER_UNUSED_KHR;
+            rayGenGroupInfo.anyHitShader       = VK_SHADER_UNUSED_KHR;
+            rayGenGroupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+        }
+        groupInfos.push_back(rayGenGroupInfo);
+
+        VkRayTracingShaderGroupCreateInfoKHR hitGroupInfo { VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR };
+        {
+            hitGroupInfo.type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+            hitGroupInfo.generalShader      = VK_SHADER_UNUSED_KHR;
+            hitGroupInfo.closestHitShader   = 1U;
+            hitGroupInfo.anyHitShader       = VK_SHADER_UNUSED_KHR;
+            hitGroupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+        }
+        groupInfos.push_back(hitGroupInfo);
+
+        VkRayTracingShaderGroupCreateInfoKHR missGroupInfo { VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR };
+        {
+            missGroupInfo.type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+            missGroupInfo.generalShader      = 2U;
+            missGroupInfo.closestHitShader   = VK_SHADER_UNUSED_KHR;
+            missGroupInfo.anyHitShader       = VK_SHADER_UNUSED_KHR;
+            missGroupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+        }
+        groupInfos.push_back(missGroupInfo);
     }
 
     VkRayTracingPipelineCreateInfoKHR rayTracingPipelineInfo { VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
     {
         rayTracingPipelineInfo.stageCount                   = static_cast<uint32_t>(stageInfos.size());
         rayTracingPipelineInfo.pStages                      = stageInfos.data();
-        rayTracingPipelineInfo.groupCount                   = 1U;
-        rayTracingPipelineInfo.pGroups                      = &rayGenGroupInfo;
+        rayTracingPipelineInfo.groupCount                   = (uint32_t)groupInfos.size();
+        rayTracingPipelineInfo.pGroups                      = groupInfos.data();
         rayTracingPipelineInfo.maxPipelineRayRecursionDepth = 1;
         rayTracingPipelineInfo.layout                       = g_PipelineLayout;
     }
@@ -650,6 +686,8 @@ void CreateRaytracingPipeline(RenderContext* pRenderContext)
     };
 
     UploadShaderHandles(g_ShaderBindingsRayGen, shaderHandles.data(), g_RayTracingProperties.shaderGroupHandleSize);
+    UploadShaderHandles(g_ShaderBindingsClosestHit, shaderHandles.data() + handleSizeAligned, g_RayTracingProperties.shaderGroupHandleSize);
+    UploadShaderHandles(g_ShaderBindingsMiss, shaderHandles.data() + handleSizeAligned * 2U, g_RayTracingProperties.shaderGroupHandleSize);
 
     spdlog::info("Created Ray Tracing Pipeline and Shader Binding Tables.");
 }
