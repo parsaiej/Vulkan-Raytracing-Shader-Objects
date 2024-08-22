@@ -549,6 +549,10 @@ void InitializeUserInterface(RenderContext* pRenderContext)
 
 void DrawUserInterface(RenderContext* pRenderContext, uint32_t swapChainImageIndex, VkCommandBuffer cmd, const std::function<void()>& interfaceFunc)
 {
+    // NOTE: Imgui internally uploads font textures with the given queue which can collide with the resource threads.
+    // So for now just lock the queue....
+    std::lock_guard<std::mutex> queueMutex(pRenderContext->GetCommandQueueMutex());
+
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();

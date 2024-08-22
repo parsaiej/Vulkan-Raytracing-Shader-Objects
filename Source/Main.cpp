@@ -1,13 +1,6 @@
 #include <Common.h>
 #include <RenderContext.h>
 
-// Forwards
-// --------------------------------------
-
-void     InitializeResources(RenderContext* pRenderContext);
-void     FreeResources(RenderContext* pRenderContext);
-uint64_t GetBufferDeviceAddress(RenderContext* pRenderContext, const Buffer& buffer);
-
 // Layout of the standard Vertex for this application.
 // ---------------------------------------------------------
 
@@ -22,6 +15,15 @@ struct RaytracingPushConstants
     glm::mat4 InverseMatrixV;
     glm::mat4 InverseMatrixP;
 };
+
+// Forwards
+// --------------------------------------
+
+void     InitializeResources(RenderContext* pRenderContext);
+void     FreeResources(RenderContext* pRenderContext);
+uint64_t GetBufferDeviceAddress(RenderContext* pRenderContext, const Buffer& buffer);
+bool     LoadMesh(const char* filePath, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices);
+bool     LoadPoints(const char* filePath, std::vector<Vertex>& vertices);
 
 // Resources
 // --------------------------------------
@@ -182,8 +184,8 @@ int main()
         vkCmdEndRendering(frameParams.cmd);
 
         // Temp camera
-        auto matrixV = glm::lookAt(glm::vec3(0, 0, -5), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
-        auto matrixP = glm::perspective(glm::radians(20.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
+        auto matrixV = glm::lookAt(glm::vec3(0, 0, -2), glm::vec3(0, 1, 0), glm::vec3(0, -1, 0));
+        auto matrixP = glm::perspective(glm::radians(60.0F), kWindowWidth / (float)kWindowHeight, 0.001F, 100.0F);
 
         {
             g_PushConstants.InverseMatrixV = glm::inverse(matrixV);
@@ -424,14 +426,20 @@ void BuildBLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
 void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint32_t indexCount)
 {
-    VkAccelerationStructureInstanceKHR tlasInstance {};
+    std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+
     {
-        tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
-        tlasInstance.instanceCustomIndex                    = 0;
-        tlasInstance.mask                                   = 0xFF;
-        tlasInstance.instanceShaderBindingTableRecordOffset = 0;
-        tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
+        VkAccelerationStructureInstanceKHR tlasInstance {};
+        {
+            tlasInstance.transform                              = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+            tlasInstance.instanceCustomIndex                    = 0;
+            tlasInstance.mask                                   = 0xFF;
+            tlasInstance.instanceShaderBindingTableRecordOffset = 0;
+            tlasInstance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            tlasInstance.accelerationStructureReference         = g_BLASDeviceAddress;
+        }
+
+        tlasInstances.push_back(tlasInstance);
     }
 
     // Create Instances Buffer.
@@ -439,7 +447,7 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
 
     VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bufferInfo.usage              = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    bufferInfo.size               = sizeof(VkAccelerationStructureInstanceKHR);
+    bufferInfo.size               = sizeof(VkAccelerationStructureInstanceKHR) * tlasInstances.size();
 
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage                   = VMA_MEMORY_USAGE_CPU_TO_GPU;
@@ -455,7 +463,7 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     Check(vmaMapMemory(pRenderContext->GetAllocator(), instanceBuffer.bufferAllocation, &pMappedData), "Failed to map a pointer to staging memory.");
     {
         // Copy from Host -> Staging memory.
-        memcpy(pMappedData, &tlasInstance, sizeof(VkAccelerationStructureInstanceKHR));
+        memcpy(pMappedData, tlasInstances.data(), sizeof(VkAccelerationStructureInstanceKHR) * tlasInstances.size());
 
         vmaUnmapMemory(pRenderContext->GetAllocator(), instanceBuffer.bufferAllocation);
     }
@@ -472,10 +480,10 @@ void BuildTLAS(RenderContext* pRenderContext, VkCommandPool vkCommandPool, uint3
     VkAccelerationStructureBuildGeometryInfoKHR tlasGeometryBuildInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
     tlasGeometryBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     tlasGeometryBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    tlasGeometryBuildInfo.geometryCount = 1;
+    tlasGeometryBuildInfo.geometryCount = (uint32_t)tlasInstances.size();
     tlasGeometryBuildInfo.pGeometries   = &tlasGeometryInfo;
 
-    const uint32_t primitiveCount = indexCount / 3U;
+    const uint32_t primitiveCount = (uint32_t)tlasInstances.size() * (indexCount / 3U);
 
     VkAccelerationStructureBuildSizesInfoKHR tlasBuildSizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     vkGetAccelerationStructureBuildSizesKHR(pRenderContext->GetDevice(),
@@ -733,51 +741,6 @@ void InitializeResources(RenderContext* pRenderContext)
     VkCommandPool vkCommandPool;
     Check(vkCreateCommandPool(pRenderContext->GetDevice(), &vkCommandPoolInfo, nullptr, &vkCommandPool), "Failed to create a Vulkan Command Pool");
 
-    // Mesh resource loading utility.
-    // ------------------------------------------------
-
-    auto LoadMesh = [&](const char* filePath, std::vector<Vertex>& vertexData, std::vector<uint32_t>& indices) -> bool
-    {
-        tinyobj::ObjReader reader;
-
-        if (!reader.ParseFromFile(filePath))
-        {
-            if (!reader.Error().empty())
-            {
-                spdlog::error("Failed to load mesh: {}", reader.Error());
-                return false;
-            }
-        }
-
-        auto& attrib = reader.GetAttrib();
-        auto& shapes = reader.GetShapes();
-
-        for (const auto& shape : shapes)
-        {
-            for (const auto& index : shape.mesh.indices)
-            {
-                Vertex v;
-
-                // Positions
-                v.positionOS.x = attrib.vertices[3U * index.vertex_index + 0U];
-                v.positionOS.y = attrib.vertices[3U * index.vertex_index + 1U];
-                v.positionOS.z = attrib.vertices[3U * index.vertex_index + 2U];
-
-                // Normals
-                v.normalOS.x = attrib.normals[3U * index.normal_index + 0U];
-                v.normalOS.y = attrib.normals[3U * index.normal_index + 1U];
-                v.normalOS.z = attrib.normals[3U * index.normal_index + 2U];
-
-                vertexData.push_back(v);
-                indices.push_back((uint32_t)indices.size());
-            }
-        }
-
-        spdlog::info("Loaded Mesh: {}", filePath);
-
-        return true;
-    };
-
     // Create staging memory.
     // ------------------------------------------------
 
@@ -854,9 +817,8 @@ void InitializeResources(RenderContext* pRenderContext)
     // Load instance transforms.
     // ------------------------------------------------
 
-    std::vector<Vertex>   instanceVertices;
-    std::vector<uint32_t> unused;
-    if (!LoadMesh("..\\Assets\\instance_transforms.obj", instanceVertices, unused))
+    std::vector<Vertex> instanceTransforms;
+    if (!LoadPoints("..\\Assets\\instance_transforms.obj", instanceTransforms))
         return;
 
     // Create device mesh.
@@ -864,7 +826,7 @@ void InitializeResources(RenderContext* pRenderContext)
 
     std::vector<Vertex>   meshVertices;
     std::vector<uint32_t> meshIndices;
-    if (!LoadMesh("..\\Assets\\bunny.obj", meshVertices, meshIndices))
+    if (!LoadMesh("..\\Assets\\bunny_low.obj", meshVertices, meshIndices))
         return;
 
     // Create dedicate device memory for the mesh buffer.
@@ -1057,3 +1019,73 @@ void FreeResources(RenderContext* pRenderContext)
     vmaDestroyBuffer(pRenderContext->GetAllocator(), g_ShaderBindingsClosestHit.buffer, g_ShaderBindingsClosestHit.bufferAllocation);
     vmaDestroyBuffer(pRenderContext->GetAllocator(), g_ShaderBindingsMiss.buffer, g_ShaderBindingsMiss.bufferAllocation);
 }
+
+bool LoadMesh(const char* filePath, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
+{
+    tinyobj::ObjReader reader;
+
+    if (!reader.ParseFromFile(filePath))
+    {
+        if (!reader.Error().empty())
+        {
+            spdlog::error("Failed to load mesh: {}", reader.Error());
+            return false;
+        }
+    }
+
+    auto& attrib = reader.GetAttrib();
+    auto& shapes = reader.GetShapes();
+
+    for (const auto& shape : shapes)
+    {
+        for (const auto& index : shape.mesh.indices)
+        {
+            Vertex v;
+
+            // Positions
+            v.positionOS.x = attrib.vertices[3U * index.vertex_index + 0U];
+            v.positionOS.y = attrib.vertices[3U * index.vertex_index + 1U];
+            v.positionOS.z = attrib.vertices[3U * index.vertex_index + 2U];
+
+            // Normals
+            v.normalOS.x = attrib.normals[3U * index.normal_index + 0U];
+            v.normalOS.y = attrib.normals[3U * index.normal_index + 1U];
+            v.normalOS.z = attrib.normals[3U * index.normal_index + 2U];
+
+            vertices.push_back(v);
+            indices.push_back((uint32_t)indices.size());
+        }
+    }
+
+    spdlog::info("Loaded Mesh: {}", filePath);
+
+    return true;
+};
+
+bool LoadPoints(const char* filePath, std::vector<Vertex>& vertices)
+{
+    tinyobj::ObjReader reader;
+
+    if (!reader.ParseFromFile(filePath))
+    {
+        if (!reader.Error().empty())
+        {
+            spdlog::error("Failed to load mesh: {}", reader.Error());
+            return false;
+        }
+    }
+
+    auto& attrib = reader.GetAttrib();
+
+    for (uint32_t pointIndex = 0U; pointIndex < attrib.vertices.size(); pointIndex += 3U)
+    {
+        Vertex v;
+        {
+            v.positionOS = glm::vec3(attrib.vertices[pointIndex + 0U], attrib.vertices[pointIndex + 1U], attrib.vertices[pointIndex + 2U]);
+            v.normalOS   = glm::vec3(attrib.normals[pointIndex + 0U], attrib.normals[pointIndex + 1U], attrib.normals[pointIndex + 2U]);
+        }
+        vertices.push_back(v);
+    }
+
+    return true;
+};
